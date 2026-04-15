@@ -44,6 +44,11 @@ pub struct Cli {
     /// Output file path. Defaults to ./schema-diff-YYYYMMDD-HHMMSS.md
     #[arg(long)]
     pub output: Option<String>,
+
+    /// When set, databases present only in the base instance are silently
+    /// excluded from the diff. Databases present only in check are still reported.
+    #[arg(long, default_value_t = false)]
+    pub ignore_base_only_dbs: bool,
 }
 
 /// Connection parameters for one MySQL instance.
@@ -66,6 +71,8 @@ pub struct Options {
     pub base_label: String,
     /// Human-readable label for the check instance used in the report.
     pub check_label: String,
+    /// If true, exclude databases present only in the base instance from the diff.
+    pub ignore_base_only_dbs: bool,
 }
 
 impl Cli {
@@ -93,6 +100,7 @@ impl Cli {
             output: self.output.clone(),
             base_label: format!("{}:{}", self.base_host, self.base_port),
             check_label: format!("{}:{}", self.check_host, self.check_port),
+            ignore_base_only_dbs: self.ignore_base_only_dbs,
         }
     }
 }
@@ -144,5 +152,26 @@ mod tests {
         let opts = cli.options();
         assert_eq!(opts.base_label, "10.0.0.1:3307");
         assert_eq!(opts.check_label, "10.0.0.2:3306");
+    }
+
+    #[test]
+    fn test_ignore_base_only_dbs_flag() {
+        let cli = Cli::parse_from([
+            "mysql-schema-diff",
+            "--base-host", "h1", "--base-user", "u", "--base-password", "p",
+            "--check-host", "h2", "--check-user", "u", "--check-password", "p",
+            "--ignore-base-only-dbs",
+        ]);
+        assert!(cli.options().ignore_base_only_dbs);
+    }
+
+    #[test]
+    fn test_ignore_base_only_dbs_default_false() {
+        let cli = Cli::parse_from([
+            "mysql-schema-diff",
+            "--base-host", "h1", "--base-user", "u", "--base-password", "p",
+            "--check-host", "h2", "--check-user", "u", "--check-password", "p",
+        ]);
+        assert!(!cli.options().ignore_base_only_dbs);
     }
 }
