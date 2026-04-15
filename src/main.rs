@@ -23,7 +23,6 @@ async fn main() -> Result<()> {
     eprintln!("Connecting to base  ({})…", opts.base_label);
     eprintln!("Connecting to check ({})…", opts.check_label);
 
-    // Fetch both snapshots concurrently.
     let (base_result, check_result) = tokio::join!(
         fetcher::fetch_snapshot(&base_cfg, db_filter.as_deref()),
         fetcher::fetch_snapshot(&check_cfg, db_filter.as_deref()),
@@ -41,23 +40,39 @@ async fn main() -> Result<()> {
         opts.base_label.clone(),
         opts.check_label.clone(),
         generated_at.clone(),
-        false,
+        opts.ignore_base_only_dbs,
     );
 
     let markdown = reporter::render(&report);
 
-    // Determine output path.
-    let output_path = opts.output.unwrap_or_else(|| {
+    // Derive output paths (strip .md suffix and add both extensions)
+    let base_path = opts.output.unwrap_or_else(|| {
         let ts = Local::now().format("%Y%m%d-%H%M%S");
-        format!("schema-diff-{}.md", ts)
+        format!("schema-diff-{}", ts)
     });
+    let md_path = if base_path.ends_with(".md") {
+        base_path.clone()
+    } else {
+        format!("{}.md", base_path)
+    };
+    let sql_path = if base_path.ends_with(".md") {
+        format!("{}.sql", &base_path[..base_path.len() - 3])
+    } else {
+        format!("{}.sql", base_path)
+    };
 
-    std::fs::write(&output_path, &markdown)
-        .with_context(|| format!("Failed to write output to {}", output_path))?;
+    std::fs::write(&md_path, &markdown)
+        .with_context(|| format!("Failed to write output to {}", md_path))?;
+    eprintln!("Report written to: {}", md_path);
 
-    eprintln!("Report written to: {}", output_path);
+    let (sql_content, warnings) = sql_generator::generate(&report);
+    for w in &warnings {
+        eprintln!("{}", w);
+    }
+    std::fs::write(&sql_path, &sql_content)
+        .with_context(|| format!("Failed to write SQL to {}", sql_path))?;
+    eprintln!("SQL sync file written to: {}", sql_path);
 
-    // Exit with code 1 if there are any differences, 0 if everything is identical.
     let has_diff = report
         .databases
         .iter()

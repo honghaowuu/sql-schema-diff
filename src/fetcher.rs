@@ -170,14 +170,14 @@ async fn fetch_columns(
     for row in rows {
         let table_name: String = row.try_get("TABLE_NAME")?;
         let is_nullable: String = row.try_get("IS_NULLABLE")?;
-        let ordinal: i64 = row.try_get("ORDINAL_POSITION")?;
+        let ordinal: u32 = row.try_get("ORDINAL_POSITION")?;
         let col = ColumnDef {
             name: row.try_get("COLUMN_NAME")?,
             column_type: row.try_get("COLUMN_TYPE")?,
             is_nullable: is_nullable == "YES",
             column_default: row.try_get("COLUMN_DEFAULT")?,
             extra: row.try_get("EXTRA")?,
-            ordinal_position: ordinal as u32,
+            ordinal_position: ordinal,
         };
         result.entry(table_name).or_default().push(col);
     }
@@ -207,8 +207,8 @@ async fn fetch_indexes(
     for row in rows {
         let table_name: String = row.try_get("TABLE_NAME")?;
         let index_name: String = row.try_get("INDEX_NAME")?;
-        let seq: i64 = row.try_get("SEQ_IN_INDEX")?;
-        let non_unique: i64 = row.try_get("NON_UNIQUE")?;
+        let seq: u32 = row.try_get("SEQ_IN_INDEX")?;
+        let non_unique: i32 = row.try_get("NON_UNIQUE")?;
         let index_type: String = row.try_get("INDEX_TYPE")?;
         let sub_part: Option<i64> = row.try_get("SUB_PART")?;
         let column_name: String = row.try_get("COLUMN_NAME")?;
@@ -217,11 +217,11 @@ async fn fetch_indexes(
             .entry(table_name)
             .or_default()
             .entry(index_name)
-            .or_insert_with(|| (non_unique == 0, index_type, vec![]));
+            .or_insert_with(|| (non_unique == 0i32, index_type, vec![]));
 
         entry.2.push(IndexColumn {
             column_name,
-            seq_in_index: seq as u32,
+            seq_in_index: seq,
             sub_part,
         });
     }
@@ -439,7 +439,7 @@ async fn fetch_triggers(
     let mut result = HashMap::new();
     for row in rows {
         let name: String = row.try_get("TRIGGER_NAME")?;
-        let action_order: i64 = row.try_get("ACTION_ORDER")?;
+        let action_order: u32 = row.try_get("ACTION_ORDER")?;
         let statement: String = row.try_get("ACTION_STATEMENT")?;
         let trigger = TriggerDef {
             name: name.clone(),
@@ -447,7 +447,7 @@ async fn fetch_triggers(
             timing: row.try_get("ACTION_TIMING")?,
             table_name: row.try_get("EVENT_OBJECT_TABLE")?,
             statement: normalize_sql(&statement),
-            action_order: action_order as u32,
+            action_order,
         };
         result.insert(name, trigger);
     }
