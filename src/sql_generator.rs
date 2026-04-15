@@ -1,7 +1,5 @@
 use crate::differ::{DatabaseDiff, DiffReport, DiffStatus, ObjectDiff, TableDiff};
-use crate::schema::{
-    CheckDef, ColumnDef, ForeignKeyDef, IndexDef, RoutineDef, TriggerDef, ViewDef,
-};
+use crate::schema::ColumnDef;
 
 /// Generate a SQL sync file from a diff report.
 ///
@@ -36,6 +34,81 @@ pub fn generate(report: &DiffReport) -> (String, Vec<String>) {
     (out, warnings)
 }
 
+fn format_col_def(col: &ColumnDef) -> String {
+    let mut parts = vec![col.column_type.clone()];
+    if col.is_nullable { parts.push("NULL".into()); } else { parts.push("NOT NULL".into()); }
+    if let Some(ref d) = col.column_default { parts.push(format!("DEFAULT {}", d)); }
+    if !col.extra.is_empty() { parts.push(col.extra.clone()); }
+    parts.join(" ")
+}
+
+fn generate_col_diffs(table_name: &str, col_diffs: &[ObjectDiff<ColumnDef>]) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Build ordinal map for AFTER clause
+    let mut base_cols_by_ord: Vec<(u32, &str)> = col_diffs
+        .iter()
+        .filter_map(|d| d.base.as_ref().map(|c| (c.ordinal_position, c.name.as_str())))
+        .collect();
+    base_cols_by_ord.sort_by_key(|(ord, _)| *ord);
+
+    for diff in col_diffs {
+        match diff.status {
+            DiffStatus::Same => {}
+            DiffStatus::OnlyInBase => {
+                let col = diff.base.as_ref().unwrap();
+                let after = base_cols_by_ord
+                    .iter()
+                    .filter(|(ord, _)| *ord < col.ordinal_position)
+                    .max_by_key(|(ord, _)| *ord)
+                    .map(|(_, name)| format!(" AFTER `{}`", name))
+                    .unwrap_or_default();
+                out.push_str(&format!("ALTER TABLE `{}` ADD COLUMN `{}` {}{};\n", table_name, col.name, format_col_def(col), after));
+            }
+            DiffStatus::OnlyInCheck => {
+                let col = diff.check.as_ref().unwrap();
+                let msg = format!("column `{}` on `{}` exists in check but not in base", col.name, table_name);
+                warnings.push(format!("[WARN] {} — review commented DROP in sync SQL", msg));
+                out.push_str(&format!("-- [WARN] {}\n", msg));
+                out.push_str(&format!("-- ALTER TABLE `{}` DROP COLUMN `{}`;\n", table_name, col.name));
+            }
+            DiffStatus::Changed => {
+                let col = diff.base.as_ref().unwrap();
+                out.push_str(&format!("ALTER TABLE `{}` MODIFY COLUMN `{}` {};\n", table_name, col.name, format_col_def(col)));
+            }
+        }
+    }
+    (out, warnings)
+}
+
+fn generate_table_diffs(tables: &[TableDiff], db_name: &str) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    for table in tables {
+        match table.status {
+            DiffStatus::Same => {}
+            DiffStatus::OnlyInCheck => {
+                let msg = format!("table `{}` in `{}` exists in check but not in base", table.name, db_name);
+                warnings.push(format!("[WARN] {} — review commented DROP in sync SQL", msg));
+                out.push_str(&format!("-- [WARN] {}\n-- DROP TABLE IF EXISTS `{}`;\n\n", msg, table.name));
+            }
+            DiffStatus::OnlyInBase => {
+                // Full CREATE TABLE implemented in Task 7; stub for now
+                out.push_str(&format!("-- TODO: CREATE TABLE `{}` (implemented in Task 7)\n\n", table.name));
+            }
+            DiffStatus::Changed => {
+                let (col_sql, col_warns) = generate_col_diffs(&table.name, &table.column_diffs);
+                out.push_str(&col_sql);
+                warnings.extend(col_warns);
+                // index/FK/check stubs filled in Tasks 5, 6, 7
+            }
+        }
+    }
+    (out, warnings)
+}
+
 fn generate_database(db: &DatabaseDiff) -> (String, Vec<String>) {
     let mut out = String::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -56,10 +129,16 @@ fn generate_database(db: &DatabaseDiff) -> (String, Vec<String>) {
         }
         DiffStatus::OnlyInBase => {
             out.push_str(&format!("CREATE DATABASE IF NOT EXISTS `{}`;\n", db.name));
-            out.push_str(&format!("USE `{}`;\n", db.name));
+            out.push_str(&format!("USE `{}`;\n\n", db.name));
+            let (t_sql, t_warns) = generate_table_diffs(&db.tables, &db.name);
+            out.push_str(&t_sql);
+            warnings.extend(t_warns);
         }
         DiffStatus::Changed => {
-            out.push_str(&format!("USE `{}`;\n", db.name));
+            out.push_str(&format!("USE `{}`;\n\n", db.name));
+            let (t_sql, t_warns) = generate_table_diffs(&db.tables, &db.name);
+            out.push_str(&t_sql);
+            warnings.extend(t_warns);
         }
         DiffStatus::Same => {}
     }
@@ -93,6 +172,38 @@ mod tests {
         }
     }
 
+    fn col(name: &str, col_type: &str, nullable: bool, default: Option<&str>, extra: &str, pos: u32) -> ColumnDef {
+        ColumnDef {
+            name: name.into(),
+            column_type: col_type.into(),
+            is_nullable: nullable,
+            column_default: default.map(|s| s.into()),
+            extra: extra.into(),
+            ordinal_position: pos,
+        }
+    }
+
+    fn col_diff(name: &str, status: DiffStatus, base: Option<ColumnDef>, check: Option<ColumnDef>) -> ObjectDiff<ColumnDef> {
+        ObjectDiff { name: name.into(), status, base, check }
+    }
+
+    fn changed_table_with_col_diff(col_diffs: Vec<ObjectDiff<ColumnDef>>) -> DatabaseDiff {
+        let table = TableDiff {
+            name: "users".into(),
+            status: DiffStatus::Changed,
+            column_diffs: col_diffs,
+            index_diffs: vec![],
+            fk_diffs: vec![],
+            check_diffs: vec![],
+        };
+        DatabaseDiff {
+            name: "mydb".into(),
+            status: DiffStatus::Changed,
+            tables: vec![table],
+            views: vec![], procedures: vec![], functions: vec![], triggers: vec![],
+        }
+    }
+
     #[test]
     fn test_empty_report_produces_header_only() {
         let (sql, warnings) = generate(&empty_report());
@@ -108,5 +219,52 @@ mod tests {
         report.databases.push(db_diff("mydb", DiffStatus::Same));
         let (sql, _) = generate(&report);
         assert!(!sql.contains("USE `mydb`"));
+    }
+
+    #[test]
+    fn test_add_column_only_in_base() {
+        let c = col("email", "varchar(255)", false, None, "", 2);
+        let db = changed_table_with_col_diff(vec![col_diff("email", DiffStatus::OnlyInBase, Some(c), None)]);
+        let mut report = empty_report();
+        report.databases.push(db);
+        let (sql, warnings) = generate(&report);
+        assert!(sql.contains("ALTER TABLE `users` ADD COLUMN `email` varchar(255) NOT NULL"), "got: {}", sql);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_modify_column() {
+        let base_col = col("age", "tinyint", false, None, "", 3);
+        let check_col = col("age", "int", false, None, "", 3);
+        let db = changed_table_with_col_diff(vec![col_diff("age", DiffStatus::Changed, Some(base_col), Some(check_col))]);
+        let mut report = empty_report();
+        report.databases.push(db);
+        let (sql, warnings) = generate(&report);
+        assert!(sql.contains("ALTER TABLE `users` MODIFY COLUMN `age` tinyint NOT NULL"), "got: {}", sql);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_warn_column_only_in_check() {
+        let c = col("old_col", "text", true, None, "", 5);
+        let db = changed_table_with_col_diff(vec![col_diff("old_col", DiffStatus::OnlyInCheck, None, Some(c))]);
+        let mut report = empty_report();
+        report.databases.push(db);
+        let (sql, warnings) = generate(&report);
+        assert!(sql.contains("-- [WARN]"), "got: {}", sql);
+        assert!(sql.contains("-- ALTER TABLE `users` DROP COLUMN `old_col`;"), "got: {}", sql);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("old_col"));
+    }
+
+    #[test]
+    fn test_add_column_with_default_and_extra() {
+        let c = col("created_at", "timestamp", false, Some("CURRENT_TIMESTAMP"), "on update CURRENT_TIMESTAMP", 4);
+        let db = changed_table_with_col_diff(vec![col_diff("created_at", DiffStatus::OnlyInBase, Some(c), None)]);
+        let mut report = empty_report();
+        report.databases.push(db);
+        let (sql, _) = generate(&report);
+        assert!(sql.contains("DEFAULT CURRENT_TIMESTAMP"), "got: {}", sql);
+        assert!(sql.contains("on update CURRENT_TIMESTAMP"), "got: {}", sql);
     }
 }
