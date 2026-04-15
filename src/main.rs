@@ -3,6 +3,7 @@ mod differ;
 mod fetcher;
 mod reporter;
 mod schema;
+mod sql_generator;
 
 use anyhow::{Context, Result};
 use chrono::Local;
