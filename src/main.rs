@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
         opts.base_label.clone(),
         opts.check_label.clone(),
         generated_at.clone(),
+        false,
     );
 
     let markdown = reporter::render(&report);

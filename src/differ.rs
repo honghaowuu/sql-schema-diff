@@ -66,10 +66,16 @@ pub fn diff(
     base_label: String,
     check_label: String,
     generated_at: String,
+    ignore_base_only: bool,
 ) -> DiffReport {
-    let mut all_dbs: BTreeSet<String> = BTreeSet::new();
-    all_dbs.extend(base.databases.keys().cloned());
-    all_dbs.extend(check.databases.keys().cloned());
+    let all_dbs: BTreeSet<String> = if ignore_base_only {
+        check.databases.keys().cloned().collect()
+    } else {
+        let mut s = BTreeSet::new();
+        s.extend(base.databases.keys().cloned());
+        s.extend(check.databases.keys().cloned());
+        s
+    };
 
     let databases = all_dbs
         .into_iter()
@@ -393,7 +399,7 @@ mod tests {
         let db = empty_db("mydb");
         let base = make_snapshot(vec![db.clone()]);
         let check = make_snapshot(vec![db]);
-        let report = diff(base, check, "base".into(), "check".into(), "now".into());
+        let report = diff(base, check, "base".into(), "check".into(), "now".into(), false);
         assert_eq!(report.databases.len(), 1);
         assert_eq!(report.databases[0].status, DiffStatus::Same);
     }
@@ -402,7 +408,7 @@ mod tests {
     fn test_db_only_in_base() {
         let base = make_snapshot(vec![empty_db("mydb")]);
         let check = make_snapshot(vec![]);
-        let report = diff(base, check, "base".into(), "check".into(), "now".into());
+        let report = diff(base, check, "base".into(), "check".into(), "now".into(), false);
         assert_eq!(report.databases[0].status, DiffStatus::OnlyInBase);
     }
 
@@ -410,7 +416,7 @@ mod tests {
     fn test_db_only_in_check() {
         let base = make_snapshot(vec![]);
         let check = make_snapshot(vec![empty_db("mydb")]);
-        let report = diff(base, check, "base".into(), "check".into(), "now".into());
+        let report = diff(base, check, "base".into(), "check".into(), "now".into(), false);
         assert_eq!(report.databases[0].status, DiffStatus::OnlyInCheck);
     }
 
@@ -425,7 +431,7 @@ mod tests {
         let report = diff(
             make_snapshot(vec![base_db]),
             make_snapshot(vec![check_db]),
-            "base".into(), "check".into(), "now".into(),
+            "base".into(), "check".into(), "now".into(), false,
         );
 
         let db_diff = &report.databases[0];
@@ -449,11 +455,36 @@ mod tests {
         let report = diff(
             make_snapshot(vec![base_db]),
             make_snapshot(vec![check_db]),
-            "base".into(), "check".into(), "now".into(),
+            "base".into(), "check".into(), "now".into(), false,
         );
 
         let db_diff = &report.databases[0];
         let table_diff = db_diff.tables.iter().find(|t| t.name == "orders").unwrap();
         assert_eq!(table_diff.status, DiffStatus::OnlyInBase);
+    }
+
+    #[test]
+    fn test_ignore_base_only_dbs_excludes_base_only_db() {
+        let base = make_snapshot(vec![empty_db("mydb")]);
+        let check = make_snapshot(vec![]);
+        let report = diff(base, check, "base".into(), "check".into(), "now".into(), true);
+        assert!(report.databases.is_empty(), "base-only db should be excluded");
+    }
+
+    #[test]
+    fn test_ignore_base_only_dbs_keeps_check_only_db() {
+        let base = make_snapshot(vec![]);
+        let check = make_snapshot(vec![empty_db("mydb")]);
+        let report = diff(base, check, "base".into(), "check".into(), "now".into(), true);
+        assert_eq!(report.databases.len(), 1);
+        assert_eq!(report.databases[0].status, DiffStatus::OnlyInCheck);
+    }
+
+    #[test]
+    fn test_flag_off_still_reports_base_only_db() {
+        let base = make_snapshot(vec![empty_db("mydb")]);
+        let check = make_snapshot(vec![]);
+        let report = diff(base, check, "base".into(), "check".into(), "now".into(), false);
+        assert_eq!(report.databases[0].status, DiffStatus::OnlyInBase);
     }
 }
