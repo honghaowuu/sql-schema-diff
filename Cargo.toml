@@ -1,0 +1,15 @@
+[package]
+name = "mysql-schema-diff"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mysql-schema-diff"
+path = "src/main.rs"
+
+[dependencies]
+sqlx = { version = "0.7", features = ["mysql", "runtime-tokio-rustls"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+chrono = "0.4"
+anyhow = "1"
