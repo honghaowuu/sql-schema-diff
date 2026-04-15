@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::{MySqlPool, Row};
@@ -52,6 +54,7 @@ async fn connect(config: &ConnectionConfig) -> Result<MySqlPool> {
 
     let pool = MySqlPoolOptions::new()
         .max_connections(3)
+        .acquire_timeout(Duration::from_secs(30))
         .connect_with(opts)
         .await?;
 
@@ -106,9 +109,13 @@ async fn fetch_tables(pool: &MySqlPool, schema: &str) -> Result<HashMap<String, 
     let foreign_keys = fetch_foreign_keys(pool, schema).await?;
     let checks = fetch_check_constraints(pool, schema).await?;
 
-    // Collect all table names from all sources.
+    // Collect all table names from all sources so tables with no columns
+    // (contrived but possible during migrations) are not silently dropped.
     let mut all_tables: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     all_tables.extend(columns.keys().cloned());
+    all_tables.extend(indexes.keys().cloned());
+    all_tables.extend(foreign_keys.keys().cloned());
+    all_tables.extend(checks.keys().cloned());
 
     let mut tables = HashMap::new();
     for table_name in all_tables {
@@ -316,14 +323,12 @@ async fn fetch_check_constraints(
 
     let rows = match result {
         Ok(rows) => rows,
-        Err(e) => {
-            let msg = e.to_string();
-            // MySQL < 8.0 doesn't have CHECK_CONSTRAINTS in information_schema.
-            if msg.contains("doesn't exist") || msg.contains("Table") {
-                return Ok(HashMap::new());
-            }
-            return Err(e).context("Failed to fetch check constraints");
+        // SQLSTATE 42S02 = ER_NO_SUCH_TABLE: MySQL < 8.0 doesn't have
+        // CHECK_CONSTRAINTS in information_schema. Treat as empty.
+        Err(sqlx::Error::Database(ref dberr)) if dberr.code().as_deref() == Some("42S02") => {
+            return Ok(HashMap::new());
         }
+        Err(e) => return Err(e).context("Failed to fetch check constraints"),
     };
 
     let mut result: HashMap<String, Vec<CheckDef>> = HashMap::new();
