@@ -1,5 +1,5 @@
 use crate::differ::{DatabaseDiff, DiffReport, DiffStatus, ObjectDiff, TableDiff};
-use crate::schema::{ColumnDef, IndexDef, IndexColumn};
+use crate::schema::{ColumnDef, IndexDef, IndexColumn, ForeignKeyDef};
 
 /// Generate a SQL sync file from a diff report.
 ///
@@ -143,6 +143,46 @@ fn generate_idx_diffs(table_name: &str, idx_diffs: &[ObjectDiff<IndexDef>]) -> (
     (out, warnings)
 }
 
+fn generate_fk_diffs(table_name: &str, fk_diffs: &[ObjectDiff<ForeignKeyDef>]) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    for diff in fk_diffs {
+        match diff.status {
+            DiffStatus::Same => {}
+            DiffStatus::OnlyInBase => {
+                let fk = diff.base.as_ref().unwrap();
+                let cols = fk.columns.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ");
+                let ref_cols = fk.ref_columns.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ");
+                out.push_str(&format!(
+                    "ALTER TABLE `{}` ADD CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES `{}` ({}) ON DELETE {} ON UPDATE {};\n",
+                    table_name, fk.name, cols, fk.ref_table, ref_cols, fk.on_delete, fk.on_update
+                ));
+            }
+            DiffStatus::OnlyInCheck => {
+                let fk = diff.check.as_ref().unwrap();
+                let msg = format!("foreign key `{}` on `{}` exists in check but not in base", fk.name, table_name);
+                warnings.push(format!("[WARN] {} — review commented DROP in sync SQL", msg));
+                out.push_str(&format!("-- [WARN] {}\n", msg));
+                out.push_str(&format!("-- ALTER TABLE `{}` DROP FOREIGN KEY `{}`;\n", table_name, fk.name));
+            }
+            DiffStatus::Changed => {
+                let base_fk = diff.base.as_ref().unwrap();
+                let check_fk = diff.check.as_ref().unwrap();
+                // Drop old FK (by check name) then add base version
+                out.push_str(&format!("ALTER TABLE `{}` DROP FOREIGN KEY `{}`;\n", table_name, check_fk.name));
+                let cols = base_fk.columns.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ");
+                let ref_cols = base_fk.ref_columns.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ");
+                out.push_str(&format!(
+                    "ALTER TABLE `{}` ADD CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES `{}` ({}) ON DELETE {} ON UPDATE {};\n",
+                    table_name, base_fk.name, cols, base_fk.ref_table, ref_cols, base_fk.on_delete, base_fk.on_update
+                ));
+            }
+        }
+    }
+    (out, warnings)
+}
+
 fn generate_table_diffs(tables: &[TableDiff], db_name: &str) -> (String, Vec<String>) {
     let mut out = String::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -166,6 +206,9 @@ fn generate_table_diffs(tables: &[TableDiff], db_name: &str) -> (String, Vec<Str
                 let (idx_sql, idx_warns) = generate_idx_diffs(&table.name, &table.index_diffs);
                 out.push_str(&idx_sql);
                 warnings.extend(idx_warns);
+                let (fk_sql, fk_warns) = generate_fk_diffs(&table.name, &table.fk_diffs);
+                out.push_str(&fk_sql);
+                warnings.extend(fk_warns);
             }
         }
     }
@@ -423,5 +466,51 @@ mod tests {
         let (sql, _) = generate(&report);
         assert!(sql.contains("DROP INDEX"), "got: {}", sql);
         assert!(sql.contains("ADD INDEX"), "got: {}", sql);
+    }
+
+    fn fk(name: &str, cols: Vec<&str>, ref_table: &str, ref_cols: Vec<&str>, on_delete: &str, on_update: &str) -> ForeignKeyDef {
+        ForeignKeyDef {
+            name: name.into(),
+            columns: cols.into_iter().map(|s| s.into()).collect(),
+            ref_table: ref_table.into(),
+            ref_columns: ref_cols.into_iter().map(|s| s.into()).collect(),
+            on_delete: on_delete.into(),
+            on_update: on_update.into(),
+        }
+    }
+
+    fn fk_diff(name: &str, status: DiffStatus, base: Option<ForeignKeyDef>, check: Option<ForeignKeyDef>) -> ObjectDiff<ForeignKeyDef> {
+        ObjectDiff { name: name.into(), status, base, check }
+    }
+
+    fn changed_table_with_fk_diff(fk_diffs: Vec<ObjectDiff<ForeignKeyDef>>) -> DatabaseDiff {
+        let table = TableDiff {
+            name: "orders".into(), status: DiffStatus::Changed,
+            column_diffs: vec![], index_diffs: vec![], fk_diffs, check_diffs: vec![],
+        };
+        DatabaseDiff {
+            name: "mydb".into(), status: DiffStatus::Changed,
+            tables: vec![table], views: vec![], procedures: vec![], functions: vec![], triggers: vec![],
+        }
+    }
+
+    #[test]
+    fn test_add_foreign_key() {
+        let f = fk("fk_user", vec!["user_id"], "users", vec!["id"], "CASCADE", "RESTRICT");
+        let db = changed_table_with_fk_diff(vec![fk_diff("fk_user", DiffStatus::OnlyInBase, Some(f), None)]);
+        let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
+        let (sql, warnings) = generate(&report);
+        assert!(sql.contains("ADD CONSTRAINT `fk_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE RESTRICT"), "got: {}", sql);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_warn_fk_only_in_check() {
+        let f = fk("fk_old", vec!["x_id"], "x", vec!["id"], "NO ACTION", "NO ACTION");
+        let db = changed_table_with_fk_diff(vec![fk_diff("fk_old", DiffStatus::OnlyInCheck, None, Some(f))]);
+        let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
+        let (sql, warnings) = generate(&report);
+        assert!(sql.contains("-- ALTER TABLE `orders` DROP FOREIGN KEY `fk_old`;"), "got: {}", sql);
+        assert_eq!(warnings.len(), 1);
     }
 }
