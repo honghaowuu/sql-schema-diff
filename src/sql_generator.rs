@@ -1,5 +1,5 @@
 use crate::differ::{DatabaseDiff, DiffReport, DiffStatus, ObjectDiff, TableDiff};
-use crate::schema::{ColumnDef, IndexDef, IndexColumn, ForeignKeyDef, CheckDef};
+use crate::schema::{ColumnDef, IndexDef, IndexColumn, ForeignKeyDef, CheckDef, ViewDef, RoutineDef, TriggerDef};
 
 /// Generate a SQL sync file from a diff report.
 ///
@@ -268,6 +268,101 @@ fn generate_create_table(table: &TableDiff) -> (String, Vec<String>) {
     (sql, vec![])
 }
 
+fn generate_view_diffs(db_name: &str, views: &[ObjectDiff<ViewDef>]) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    for diff in views {
+        match diff.status {
+            DiffStatus::Same => {}
+            DiffStatus::OnlyInBase | DiffStatus::Changed => {
+                let v = diff.base.as_ref().unwrap();
+                out.push_str(&format!("CREATE OR REPLACE VIEW `{}` AS {};\n", v.name, v.definition));
+            }
+            DiffStatus::OnlyInCheck => {
+                let v = diff.check.as_ref().unwrap();
+                let msg = format!("view `{}` in `{}` exists in check but not in base", v.name, db_name);
+                warnings.push(format!("[WARN] {} — review commented DROP in sync SQL", msg));
+                out.push_str(&format!("-- [WARN] {}\n", msg));
+                out.push_str(&format!("-- DROP VIEW IF EXISTS `{}`;\n", v.name));
+            }
+        }
+    }
+    (out, warnings)
+}
+
+fn generate_routine_diffs(db_name: &str, routines: &[ObjectDiff<RoutineDef>]) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    for diff in routines {
+        match diff.status {
+            DiffStatus::Same => {}
+            DiffStatus::OnlyInBase | DiffStatus::Changed => {
+                let r = diff.base.as_ref().unwrap();
+                let deterministic = if r.is_deterministic == "YES" { "DETERMINISTIC" } else { "NOT DETERMINISTIC" };
+                out.push_str(&format!("DROP {} IF EXISTS `{}`;\n", r.routine_type, r.name));
+                out.push_str("DELIMITER $$\n");
+                out.push_str(&format!(
+                    "-- NOTE: parameter list not captured — add parameters manually\n\
+                     CREATE {} `{}`( /* add parameters here */ )\n\
+                     {}\n\
+                     {}\n\
+                     SQL SECURITY {}\n\
+                     {}\n\
+                     $$\n",
+                    r.routine_type, r.name,
+                    deterministic,
+                    r.sql_data_access,
+                    r.security_type,
+                    r.definition
+                ));
+                out.push_str("DELIMITER ;\n\n");
+            }
+            DiffStatus::OnlyInCheck => {
+                let r = diff.check.as_ref().unwrap();
+                let msg = format!(
+                    "{} `{}` in `{}` exists in check but not in base",
+                    r.routine_type.to_lowercase(), r.name, db_name
+                );
+                warnings.push(format!("[WARN] {} — review commented DROP in sync SQL", msg));
+                out.push_str(&format!("-- [WARN] {}\n", msg));
+                out.push_str(&format!("-- DROP {} IF EXISTS `{}`;\n", r.routine_type, r.name));
+            }
+        }
+    }
+    (out, warnings)
+}
+
+fn generate_trigger_diffs(db_name: &str, triggers: &[ObjectDiff<TriggerDef>]) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    for diff in triggers {
+        match diff.status {
+            DiffStatus::Same => {}
+            DiffStatus::OnlyInBase | DiffStatus::Changed => {
+                let t = diff.base.as_ref().unwrap();
+                out.push_str(&format!("DROP TRIGGER IF EXISTS `{}`;\n", t.name));
+                out.push_str("DELIMITER $$\n");
+                out.push_str(&format!(
+                    "CREATE TRIGGER `{}` {} {} ON `{}` FOR EACH ROW\n{}\n$$\n",
+                    t.name, t.timing, t.event, t.table_name, t.statement
+                ));
+                out.push_str("DELIMITER ;\n\n");
+            }
+            DiffStatus::OnlyInCheck => {
+                let t = diff.check.as_ref().unwrap();
+                let msg = format!("trigger `{}` in `{}` exists in check but not in base", t.name, db_name);
+                warnings.push(format!("[WARN] {} — review commented DROP in sync SQL", msg));
+                out.push_str(&format!("-- [WARN] {}\n", msg));
+                out.push_str(&format!("-- DROP TRIGGER IF EXISTS `{}`;\n", t.name));
+            }
+        }
+    }
+    (out, warnings)
+}
+
 fn generate_database(db: &DatabaseDiff) -> (String, Vec<String>) {
     let mut out = String::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -292,12 +387,36 @@ fn generate_database(db: &DatabaseDiff) -> (String, Vec<String>) {
             let (t_sql, t_warns) = generate_table_diffs(&db.tables, &db.name);
             out.push_str(&t_sql);
             warnings.extend(t_warns);
+            let (v_sql, v_warns) = generate_view_diffs(&db.name, &db.views);
+            out.push_str(&v_sql);
+            warnings.extend(v_warns);
+            let (p_sql, p_warns) = generate_routine_diffs(&db.name, &db.procedures);
+            out.push_str(&p_sql);
+            warnings.extend(p_warns);
+            let (f_sql, f_warns) = generate_routine_diffs(&db.name, &db.functions);
+            out.push_str(&f_sql);
+            warnings.extend(f_warns);
+            let (tg_sql, tg_warns) = generate_trigger_diffs(&db.name, &db.triggers);
+            out.push_str(&tg_sql);
+            warnings.extend(tg_warns);
         }
         DiffStatus::Changed => {
             out.push_str(&format!("USE `{}`;\n\n", db.name));
             let (t_sql, t_warns) = generate_table_diffs(&db.tables, &db.name);
             out.push_str(&t_sql);
             warnings.extend(t_warns);
+            let (v_sql, v_warns) = generate_view_diffs(&db.name, &db.views);
+            out.push_str(&v_sql);
+            warnings.extend(v_warns);
+            let (p_sql, p_warns) = generate_routine_diffs(&db.name, &db.procedures);
+            out.push_str(&p_sql);
+            warnings.extend(p_warns);
+            let (f_sql, f_warns) = generate_routine_diffs(&db.name, &db.functions);
+            out.push_str(&f_sql);
+            warnings.extend(f_warns);
+            let (tg_sql, tg_warns) = generate_trigger_diffs(&db.name, &db.triggers);
+            out.push_str(&tg_sql);
+            warnings.extend(tg_warns);
         }
         DiffStatus::Same => {}
     }
@@ -633,6 +752,122 @@ mod tests {
         let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
         let (sql, warnings) = generate(&report);
         assert!(sql.contains("-- DROP TABLE IF EXISTS `legacy`;"), "got: {}", sql);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    fn view(name: &str, def: &str) -> ViewDef { ViewDef { name: name.into(), definition: def.into() } }
+    fn view_diff(name: &str, status: DiffStatus, base: Option<ViewDef>, check: Option<ViewDef>) -> ObjectDiff<ViewDef> {
+        ObjectDiff { name: name.into(), status, base, check }
+    }
+    fn db_with_view(v: ObjectDiff<ViewDef>) -> DiffReport {
+        DiffReport {
+            base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(),
+            databases: vec![DatabaseDiff {
+                name: "mydb".into(), status: DiffStatus::Changed,
+                tables: vec![], views: vec![v], procedures: vec![], functions: vec![], triggers: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn test_create_or_replace_view_only_in_base() {
+        let (sql, w) = generate(&db_with_view(view_diff("v_users", DiffStatus::OnlyInBase,
+            Some(view("v_users", "SELECT id FROM users")), None)));
+        assert!(sql.contains("CREATE OR REPLACE VIEW `v_users` AS SELECT id FROM users;"), "got: {}", sql);
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn test_create_or_replace_view_changed() {
+        let (sql, _) = generate(&db_with_view(view_diff("v_users", DiffStatus::Changed,
+            Some(view("v_users", "SELECT id, name FROM users")),
+            Some(view("v_users", "SELECT id FROM users")))));
+        assert!(sql.contains("CREATE OR REPLACE VIEW `v_users` AS SELECT id, name FROM users;"), "got: {}", sql);
+    }
+
+    #[test]
+    fn test_warn_view_only_in_check() {
+        let (sql, warnings) = generate(&db_with_view(view_diff("v_old", DiffStatus::OnlyInCheck,
+            None, Some(view("v_old", "SELECT 1")))));
+        assert!(sql.contains("-- DROP VIEW IF EXISTS `v_old`;"), "got: {}", sql);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    fn routine(name: &str, rtype: &str, def: &str) -> RoutineDef {
+        RoutineDef {
+            name: name.into(), routine_type: rtype.into(),
+            definition: def.into(), is_deterministic: "NO".into(),
+            sql_data_access: "MODIFIES SQL DATA".into(), security_type: "DEFINER".into(),
+        }
+    }
+    fn proc_diff(name: &str, status: DiffStatus, base: Option<RoutineDef>, check: Option<RoutineDef>) -> ObjectDiff<RoutineDef> {
+        ObjectDiff { name: name.into(), status, base, check }
+    }
+    fn db_with_proc(p: ObjectDiff<RoutineDef>) -> DiffReport {
+        DiffReport {
+            base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(),
+            databases: vec![DatabaseDiff {
+                name: "mydb".into(), status: DiffStatus::Changed,
+                tables: vec![], views: vec![], procedures: vec![p], functions: vec![], triggers: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn test_create_procedure_only_in_base() {
+        let r = routine("sp_foo", "PROCEDURE", "BEGIN SELECT 1; END");
+        let (sql, w) = generate(&db_with_proc(proc_diff("sp_foo", DiffStatus::OnlyInBase, Some(r), None)));
+        assert!(sql.contains("DROP PROCEDURE IF EXISTS `sp_foo`;"), "got: {}", sql);
+        assert!(sql.contains("CREATE PROCEDURE `sp_foo`"), "got: {}", sql);
+        assert!(sql.contains("MODIFIES SQL DATA"), "got: {}", sql);
+        assert!(sql.contains("SQL SECURITY DEFINER"), "got: {}", sql);
+        assert!(sql.contains("BEGIN SELECT 1; END"), "got: {}", sql);
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn test_warn_procedure_only_in_check() {
+        let r = routine("sp_old", "PROCEDURE", "BEGIN END");
+        let (sql, warnings) = generate(&db_with_proc(proc_diff("sp_old", DiffStatus::OnlyInCheck, None, Some(r))));
+        assert!(sql.contains("-- DROP PROCEDURE IF EXISTS `sp_old`;"), "got: {}", sql);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    fn trig(name: &str) -> TriggerDef {
+        TriggerDef {
+            name: name.into(), event: "INSERT".into(), timing: "BEFORE".into(),
+            table_name: "orders".into(), statement: "BEGIN SET NEW.ts = NOW(); END".into(),
+            action_order: 1,
+        }
+    }
+    fn trig_diff(name: &str, status: DiffStatus, base: Option<TriggerDef>, check: Option<TriggerDef>) -> ObjectDiff<TriggerDef> {
+        ObjectDiff { name: name.into(), status, base, check }
+    }
+    fn db_with_trigger(t: ObjectDiff<TriggerDef>) -> DiffReport {
+        DiffReport {
+            base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(),
+            databases: vec![DatabaseDiff {
+                name: "mydb".into(), status: DiffStatus::Changed,
+                tables: vec![], views: vec![], procedures: vec![], functions: vec![], triggers: vec![t],
+            }],
+        }
+    }
+
+    #[test]
+    fn test_create_trigger_only_in_base() {
+        let t = trig("trg_orders_bi");
+        let (sql, w) = generate(&db_with_trigger(trig_diff("trg_orders_bi", DiffStatus::OnlyInBase, Some(t), None)));
+        assert!(sql.contains("DROP TRIGGER IF EXISTS `trg_orders_bi`;"), "got: {}", sql);
+        assert!(sql.contains("CREATE TRIGGER `trg_orders_bi`"), "got: {}", sql);
+        assert!(sql.contains("BEFORE INSERT ON `orders`"), "got: {}", sql);
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn test_warn_trigger_only_in_check() {
+        let t = trig("trg_old");
+        let (sql, warnings) = generate(&db_with_trigger(trig_diff("trg_old", DiffStatus::OnlyInCheck, None, Some(t))));
+        assert!(sql.contains("-- DROP TRIGGER IF EXISTS `trg_old`;"), "got: {}", sql);
         assert_eq!(warnings.len(), 1);
     }
 }
