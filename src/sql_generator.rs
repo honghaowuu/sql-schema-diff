@@ -1,5 +1,5 @@
 use crate::differ::{DatabaseDiff, DiffReport, DiffStatus, ObjectDiff, TableDiff};
-use crate::schema::ColumnDef;
+use crate::schema::{ColumnDef, IndexDef, IndexColumn};
 
 /// Generate a SQL sync file from a diff report.
 ///
@@ -82,6 +82,67 @@ fn generate_col_diffs(table_name: &str, col_diffs: &[ObjectDiff<ColumnDef>]) -> 
     (out, warnings)
 }
 
+fn format_index_cols(cols: &[IndexColumn]) -> String {
+    let mut sorted = cols.to_vec();
+    sorted.sort_by_key(|c| c.seq_in_index);
+    sorted.iter().map(|c| {
+        if let Some(sp) = c.sub_part {
+            format!("`{}`({})", c.column_name, sp)
+        } else {
+            format!("`{}`", c.column_name)
+        }
+    }).collect::<Vec<_>>().join(", ")
+}
+
+fn format_add_index(table_name: &str, idx: &IndexDef) -> String {
+    let cols = format_index_cols(&idx.columns);
+    let using = if idx.index_type == "HASH" { " USING HASH" } else { "" };
+    if idx.name == "PRIMARY" {
+        format!("ALTER TABLE `{}` ADD PRIMARY KEY ({}){};\n", table_name, cols, using)
+    } else if idx.is_unique {
+        format!("ALTER TABLE `{}` ADD UNIQUE INDEX `{}` ({}){};\n", table_name, idx.name, cols, using)
+    } else {
+        format!("ALTER TABLE `{}` ADD INDEX `{}` ({}){};\n", table_name, idx.name, cols, using)
+    }
+}
+
+fn generate_idx_diffs(table_name: &str, idx_diffs: &[ObjectDiff<IndexDef>]) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    for diff in idx_diffs {
+        match diff.status {
+            DiffStatus::Same => {}
+            DiffStatus::OnlyInBase => {
+                out.push_str(&format_add_index(table_name, diff.base.as_ref().unwrap()));
+            }
+            DiffStatus::OnlyInCheck => {
+                let idx = diff.check.as_ref().unwrap();
+                let msg = format!("index `{}` on `{}` exists in check but not in base", idx.name, table_name);
+                warnings.push(format!("[WARN] {} — review commented DROP in sync SQL", msg));
+                out.push_str(&format!("-- [WARN] {}\n", msg));
+                if idx.name == "PRIMARY" {
+                    out.push_str(&format!("-- ALTER TABLE `{}` DROP PRIMARY KEY;\n", table_name));
+                } else {
+                    out.push_str(&format!("-- ALTER TABLE `{}` DROP INDEX `{}`;\n", table_name, idx.name));
+                }
+            }
+            DiffStatus::Changed => {
+                let base_idx = diff.base.as_ref().unwrap();
+                // For Changed indexes: drop the old (by check name) then add base version
+                // Using base name since both sides share the same name for Changed
+                if base_idx.name == "PRIMARY" {
+                    out.push_str(&format!("ALTER TABLE `{}` DROP PRIMARY KEY;\n", table_name));
+                } else {
+                    out.push_str(&format!("ALTER TABLE `{}` DROP INDEX `{}`;\n", table_name, base_idx.name));
+                }
+                out.push_str(&format_add_index(table_name, base_idx));
+            }
+        }
+    }
+    (out, warnings)
+}
+
 fn generate_table_diffs(tables: &[TableDiff], db_name: &str) -> (String, Vec<String>) {
     let mut out = String::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -102,7 +163,9 @@ fn generate_table_diffs(tables: &[TableDiff], db_name: &str) -> (String, Vec<Str
                 let (col_sql, col_warns) = generate_col_diffs(&table.name, &table.column_diffs);
                 out.push_str(&col_sql);
                 warnings.extend(col_warns);
-                // index/FK/check stubs filled in Tasks 5, 6, 7
+                let (idx_sql, idx_warns) = generate_idx_diffs(&table.name, &table.index_diffs);
+                out.push_str(&idx_sql);
+                warnings.extend(idx_warns);
             }
         }
     }
@@ -204,6 +267,34 @@ mod tests {
         }
     }
 
+    fn idx(name: &str, unique: bool, idx_type: &str, cols: Vec<(&str, Option<i64>)>) -> IndexDef {
+        IndexDef {
+            name: name.into(),
+            index_type: idx_type.into(),
+            is_unique: unique,
+            columns: cols.into_iter().enumerate().map(|(i, (col, sp))| IndexColumn {
+                column_name: col.into(),
+                seq_in_index: (i + 1) as u32,
+                sub_part: sp,
+            }).collect(),
+        }
+    }
+
+    fn idx_diff(name: &str, status: DiffStatus, base: Option<IndexDef>, check: Option<IndexDef>) -> ObjectDiff<IndexDef> {
+        ObjectDiff { name: name.into(), status, base, check }
+    }
+
+    fn changed_table_with_idx_diff(idx_diffs: Vec<ObjectDiff<IndexDef>>) -> DatabaseDiff {
+        let table = TableDiff {
+            name: "users".into(), status: DiffStatus::Changed,
+            column_diffs: vec![], index_diffs: idx_diffs, fk_diffs: vec![], check_diffs: vec![],
+        };
+        DatabaseDiff {
+            name: "mydb".into(), status: DiffStatus::Changed,
+            tables: vec![table], views: vec![], procedures: vec![], functions: vec![], triggers: vec![],
+        }
+    }
+
     #[test]
     fn test_empty_report_produces_header_only() {
         let (sql, warnings) = generate(&empty_report());
@@ -266,5 +357,71 @@ mod tests {
         let (sql, _) = generate(&report);
         assert!(sql.contains("DEFAULT CURRENT_TIMESTAMP"), "got: {}", sql);
         assert!(sql.contains("on update CURRENT_TIMESTAMP"), "got: {}", sql);
+    }
+
+    #[test]
+    fn test_add_regular_index() {
+        let i = idx("idx_email", false, "BTREE", vec![("email", None)]);
+        let db = changed_table_with_idx_diff(vec![idx_diff("idx_email", DiffStatus::OnlyInBase, Some(i), None)]);
+        let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
+        let (sql, _) = generate(&report);
+        assert!(sql.contains("ALTER TABLE `users` ADD INDEX `idx_email` (`email`)"), "got: {}", sql);
+    }
+
+    #[test]
+    fn test_add_unique_index() {
+        let i = idx("uq_email", true, "BTREE", vec![("email", None)]);
+        let db = changed_table_with_idx_diff(vec![idx_diff("uq_email", DiffStatus::OnlyInBase, Some(i), None)]);
+        let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
+        let (sql, _) = generate(&report);
+        assert!(sql.contains("ADD UNIQUE INDEX `uq_email`"), "got: {}", sql);
+    }
+
+    #[test]
+    fn test_add_primary_key() {
+        let i = idx("PRIMARY", false, "BTREE", vec![("id", None)]);
+        let db = changed_table_with_idx_diff(vec![idx_diff("PRIMARY", DiffStatus::OnlyInBase, Some(i), None)]);
+        let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
+        let (sql, _) = generate(&report);
+        assert!(sql.contains("ADD PRIMARY KEY (`id`)"), "got: {}", sql);
+    }
+
+    #[test]
+    fn test_partial_index_uses_sub_part() {
+        let i = idx("idx_bio", false, "BTREE", vec![("bio", Some(100))]);
+        let db = changed_table_with_idx_diff(vec![idx_diff("idx_bio", DiffStatus::OnlyInBase, Some(i), None)]);
+        let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
+        let (sql, _) = generate(&report);
+        assert!(sql.contains("`bio`(100)"), "got: {}", sql);
+    }
+
+    #[test]
+    fn test_hash_index_emits_using_clause() {
+        let i = idx("idx_hash", false, "HASH", vec![("token", None)]);
+        let db = changed_table_with_idx_diff(vec![idx_diff("idx_hash", DiffStatus::OnlyInBase, Some(i), None)]);
+        let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
+        let (sql, _) = generate(&report);
+        assert!(sql.contains("USING HASH"), "got: {}", sql);
+    }
+
+    #[test]
+    fn test_warn_index_only_in_check() {
+        let i = idx("old_idx", false, "BTREE", vec![("x", None)]);
+        let db = changed_table_with_idx_diff(vec![idx_diff("old_idx", DiffStatus::OnlyInCheck, None, Some(i))]);
+        let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
+        let (sql, warnings) = generate(&report);
+        assert!(sql.contains("-- ALTER TABLE `users` DROP INDEX `old_idx`;"), "got: {}", sql);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn test_changed_index_drops_then_adds() {
+        let base_i = idx("idx_x", false, "BTREE", vec![("x", None)]);
+        let check_i = idx("idx_x", false, "BTREE", vec![("y", None)]);
+        let db = changed_table_with_idx_diff(vec![idx_diff("idx_x", DiffStatus::Changed, Some(base_i), Some(check_i))]);
+        let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
+        let (sql, _) = generate(&report);
+        assert!(sql.contains("DROP INDEX"), "got: {}", sql);
+        assert!(sql.contains("ADD INDEX"), "got: {}", sql);
     }
 }
