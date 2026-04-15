@@ -1,4 +1,5 @@
 mod config;
+mod differ;
 mod schema;
 
 fn main() {
