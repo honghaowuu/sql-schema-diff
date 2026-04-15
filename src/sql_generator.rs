@@ -1,5 +1,5 @@
 use crate::differ::{DatabaseDiff, DiffReport, DiffStatus, ObjectDiff, TableDiff};
-use crate::schema::{ColumnDef, IndexDef, IndexColumn, ForeignKeyDef};
+use crate::schema::{ColumnDef, IndexDef, IndexColumn, ForeignKeyDef, CheckDef};
 
 /// Generate a SQL sync file from a diff report.
 ///
@@ -196,8 +196,9 @@ fn generate_table_diffs(tables: &[TableDiff], db_name: &str) -> (String, Vec<Str
                 out.push_str(&format!("-- [WARN] {}\n-- DROP TABLE IF EXISTS `{}`;\n\n", msg, table.name));
             }
             DiffStatus::OnlyInBase => {
-                // Full CREATE TABLE implemented in Task 7; stub for now
-                out.push_str(&format!("-- TODO: CREATE TABLE `{}` (implemented in Task 7)\n\n", table.name));
+                let (ct_sql, ct_warns) = generate_create_table(&table);
+                out.push_str(&ct_sql);
+                warnings.extend(ct_warns);
             }
             DiffStatus::Changed => {
                 let (col_sql, col_warns) = generate_col_diffs(&table.name, &table.column_diffs);
@@ -213,6 +214,58 @@ fn generate_table_diffs(tables: &[TableDiff], db_name: &str) -> (String, Vec<Str
         }
     }
     (out, warnings)
+}
+
+fn generate_create_table(table: &TableDiff) -> (String, Vec<String>) {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Columns (sorted by ordinal_position)
+    let mut base_cols: Vec<&ColumnDef> = table.column_diffs.iter()
+        .filter_map(|d| d.base.as_ref())
+        .collect();
+    base_cols.sort_by_key(|c| c.ordinal_position);
+
+    for col in &base_cols {
+        parts.push(format!("  `{}` {}", col.name, format_col_def(col)));
+    }
+
+    // Indexes
+    for idx_diff in &table.index_diffs {
+        if let Some(idx) = &idx_diff.base {
+            let cols = format_index_cols(&idx.columns);
+            let using = if idx.index_type == "HASH" { " USING HASH" } else { "" };
+            if idx.name == "PRIMARY" {
+                parts.push(format!("  PRIMARY KEY ({}){}", cols, using));
+            } else if idx.is_unique {
+                parts.push(format!("  UNIQUE KEY `{}` ({}){}", idx.name, cols, using));
+            } else {
+                parts.push(format!("  KEY `{}` ({}){}", idx.name, cols, using));
+            }
+        }
+    }
+
+    // Foreign keys
+    for fk_diff in &table.fk_diffs {
+        if let Some(fk) = &fk_diff.base {
+            let cols = fk.columns.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ");
+            let ref_cols = fk.ref_columns.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ");
+            parts.push(format!(
+                "  CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES `{}` ({}) ON DELETE {} ON UPDATE {}",
+                fk.name, cols, fk.ref_table, ref_cols, fk.on_delete, fk.on_update
+            ));
+        }
+    }
+
+    // Check constraints (MySQL 8.0+ only; empty on 5.x)
+    for ch_diff in &table.check_diffs {
+        if let Some(ch) = &ch_diff.base {
+            parts.push(format!("  CONSTRAINT `{}` CHECK ({})", ch.name, ch.clause));
+        }
+    }
+
+    let body = parts.join(",\n");
+    let sql = format!("CREATE TABLE IF NOT EXISTS `{}` (\n{}\n);\n\n", table.name, body);
+    (sql, vec![])
 }
 
 fn generate_database(db: &DatabaseDiff) -> (String, Vec<String>) {
@@ -494,6 +547,10 @@ mod tests {
         }
     }
 
+    fn check_diff(name: &str, status: DiffStatus, base: Option<CheckDef>, check: Option<CheckDef>) -> ObjectDiff<CheckDef> {
+        ObjectDiff { name: name.into(), status, base, check }
+    }
+
     #[test]
     fn test_add_foreign_key() {
         let f = fk("fk_user", vec!["user_id"], "users", vec!["id"], "CASCADE", "RESTRICT");
@@ -511,6 +568,71 @@ mod tests {
         let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
         let (sql, warnings) = generate(&report);
         assert!(sql.contains("-- ALTER TABLE `orders` DROP FOREIGN KEY `fk_old`;"), "got: {}", sql);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn test_create_table_only_in_base() {
+        let col_diffs = vec![
+            col_diff("id", DiffStatus::OnlyInBase,
+                Some(col("id", "int unsigned", false, None, "auto_increment", 1)), None),
+            col_diff("name", DiffStatus::OnlyInBase,
+                Some(col("name", "varchar(100)", false, None, "", 2)), None),
+        ];
+        let idx_diffs = vec![
+            idx_diff("PRIMARY", DiffStatus::OnlyInBase,
+                Some(idx("PRIMARY", false, "BTREE", vec![("id", None)])), None),
+        ];
+        let table = TableDiff {
+            name: "products".into(), status: DiffStatus::OnlyInBase,
+            column_diffs: col_diffs, index_diffs: idx_diffs, fk_diffs: vec![], check_diffs: vec![],
+        };
+        let db = DatabaseDiff {
+            name: "mydb".into(), status: DiffStatus::Changed,
+            tables: vec![table], views: vec![], procedures: vec![], functions: vec![], triggers: vec![],
+        };
+        let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
+        let (sql, warnings) = generate(&report);
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS `products`"), "got: {}", sql);
+        assert!(sql.contains("`id` int unsigned NOT NULL auto_increment"), "got: {}", sql);
+        assert!(sql.contains("`name` varchar(100) NOT NULL"), "got: {}", sql);
+        assert!(sql.contains("PRIMARY KEY (`id`)"), "got: {}", sql);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_create_table_with_check_constraint() {
+        let col_diffs = vec![
+            col_diff("id", DiffStatus::OnlyInBase, Some(col("id", "int", false, None, "", 1)), None),
+        ];
+        let check_diffs = vec![check_diff("chk_positive", DiffStatus::OnlyInBase,
+            Some(CheckDef { name: "chk_positive".into(), clause: "`id` > 0".into() }), None)];
+        let table = TableDiff {
+            name: "items".into(), status: DiffStatus::OnlyInBase,
+            column_diffs: col_diffs, index_diffs: vec![], fk_diffs: vec![], check_diffs,
+        };
+        let db = DatabaseDiff {
+            name: "mydb".into(), status: DiffStatus::Changed,
+            tables: vec![table], views: vec![], procedures: vec![], functions: vec![], triggers: vec![],
+        };
+        let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
+        let (sql, _) = generate(&report);
+        assert!(sql.contains("CONSTRAINT `chk_positive` CHECK (`id` > 0)"), "got: {}", sql);
+    }
+
+    #[test]
+    fn test_warn_table_only_in_check() {
+        let table = TableDiff {
+            name: "legacy".into(), status: DiffStatus::OnlyInCheck,
+            column_diffs: vec![], index_diffs: vec![], fk_diffs: vec![], check_diffs: vec![],
+        };
+        let db = DatabaseDiff {
+            name: "mydb".into(), status: DiffStatus::Changed,
+            tables: vec![table], views: vec![], procedures: vec![], functions: vec![], triggers: vec![],
+        };
+        let report = DiffReport { base_label: "b".into(), check_label: "c".into(), generated_at: "t".into(), databases: vec![db] };
+        let (sql, warnings) = generate(&report);
+        assert!(sql.contains("-- DROP TABLE IF EXISTS `legacy`;"), "got: {}", sql);
         assert_eq!(warnings.len(), 1);
     }
 }
