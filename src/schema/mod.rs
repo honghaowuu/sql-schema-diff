@@ -32,7 +32,7 @@ pub struct TableDef {
     pub checks: Vec<CheckDef>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ColumnDef {
     pub name: String,
     /// Full type string from MySQL, e.g. "varchar(255)", "int unsigned".
@@ -42,6 +42,18 @@ pub struct ColumnDef {
     /// e.g. "auto_increment", "on update CURRENT_TIMESTAMP", or empty string.
     pub extra: String,
     pub ordinal_position: u32,
+}
+
+impl PartialEq for ColumnDef {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.column_type == other.column_type
+            && self.is_nullable == other.is_nullable
+            && self.column_default == other.column_default
+            && self.extra == other.extra
+        // ordinal_position intentionally excluded: column order differences
+        // between instances are not considered a schema change.
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
