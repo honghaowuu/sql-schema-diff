@@ -42,7 +42,8 @@ mysql-schema-diff \
 | `--check-user` | *(required)* | Username for the check instance |
 | `--check-password` | *(required)* | Password for the check instance |
 | `--databases` | all non-system DBs | Comma-separated list of databases to compare |
-| `--output` | `schema-diff-YYYYMMDD-HHMMSS.md` | Output file path |
+| `--output` | `schema-diff-YYYYMMDD-HHMMSS` | Base path for output files (`.md` and `.sql` are appended) |
+| `--ignore-base-only-dbs` | `false` | Silently skip databases present only in the base instance |
 
 ### Example
 
@@ -54,7 +55,10 @@ mysql-schema-diff \
   --output diff.md
 ```
 
-Both instances are queried concurrently. Progress is printed to stderr; the report is written to the output file.
+Both instances are queried concurrently. Progress is printed to stderr; two output files are written:
+
+- `<base>.md` — human-readable Markdown diff report
+- `<base>.sql` — SQL sync script to bring the check instance in line with base
 
 ## Exit codes
 
@@ -66,9 +70,9 @@ Both instances are queried concurrently. Progress is printed to stderr; the repo
 
 This makes the tool CI-friendly — you can fail a pipeline on any detected schema drift.
 
-## Report format
+## Output format
 
-The output is a Markdown file with:
+### Markdown report (`<base>.md`)
 
 - A header showing the two instance labels and the timestamp
 - A summary of how many databases were compared and how many differ
@@ -78,15 +82,27 @@ The output is a Markdown file with:
 
 Objects that are identical between the two instances are not listed.
 
+### SQL sync script (`<base>.sql`)
+
+An executable SQL file that, when applied to the **check** instance, brings it in line with **base**:
+
+- `ALTER TABLE` statements for column, index, and foreign key differences
+- `CREATE TABLE` for tables present only in base
+- `CREATE OR REPLACE` for views, routines, and triggers present only in base
+- Lines prefixed with `-- [WARN]` are commented out — they describe objects present in check but not in base (destructive drops require manual review)
+- Wrapped in `SET FOREIGN_KEY_CHECKS = 0/1`
+- `DELIMITER` directives are included for the `mysql` CLI; strip them when using programmatic APIs
+
 ## Architecture
 
 ```
 CLI args (clap)
-    └─► config.rs        — Cli struct, ConnectionConfig, Options
-         └─► fetcher.rs  — async queries against information_schema → SchemaSnapshot
-              └─► differ.rs   — diff two SchemaSnapshots → DiffReport
-                   └─► reporter.rs — render DiffReport → Markdown string
-                        └─► main.rs — write file, exit with code
+    └─► config.rs          — Cli struct, ConnectionConfig, Options
+         └─► fetcher.rs    — async queries against information_schema → SchemaSnapshot
+              └─► differ.rs       — diff two SchemaSnapshots → DiffReport
+                   ├─► reporter.rs      — render DiffReport → Markdown string
+                   └─► sql_generator.rs — render DiffReport → SQL sync script
+                        └─► main.rs — write .md + .sql files, exit with code
 ```
 
 ## Requirements

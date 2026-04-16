@@ -1,5 +1,5 @@
 use crate::differ::{DatabaseDiff, DiffReport, DiffStatus, ObjectDiff, TableDiff};
-use crate::schema::{ColumnDef, IndexDef, IndexColumn, ForeignKeyDef, CheckDef, ViewDef, RoutineDef, TriggerDef};
+use crate::schema::{ColumnDef, IndexDef, IndexColumn, ForeignKeyDef, ViewDef, RoutineDef, TriggerDef};
 
 /// Generate a SQL sync file from a diff report.
 ///
@@ -428,6 +428,7 @@ fn generate_database(db: &DatabaseDiff) -> (String, Vec<String>) {
 mod tests {
     use super::*;
     use crate::differ::*;
+    use crate::schema::CheckDef;
 
     fn empty_report() -> DiffReport {
         DiffReport {
