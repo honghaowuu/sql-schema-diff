@@ -207,7 +207,9 @@ async fn fetch_indexes(
     for row in rows {
         let table_name: String = row.try_get("TABLE_NAME")?;
         let index_name: String = row.try_get("INDEX_NAME")?;
-        let seq: i64 = row.try_get("SEQ_IN_INDEX")?;
+        let seq: i64 = row.try_get::<u32, _>("SEQ_IN_INDEX")
+            .map(|v| v as i64)
+            .or_else(|_| row.try_get::<i64, _>("SEQ_IN_INDEX"))?;
         let non_unique: i32 = row.try_get("NON_UNIQUE")?;
         let index_type: String = row.try_get("INDEX_TYPE")?;
         let sub_part: Option<i64> = row.try_get("SUB_PART")?;
