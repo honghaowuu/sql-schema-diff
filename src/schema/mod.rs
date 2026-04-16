@@ -69,7 +69,7 @@ pub struct IndexDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexColumn {
     pub column_name: String,
-    pub seq_in_index: u32,
+    pub seq_in_index: i64,
     /// Prefix length for partial indexes (e.g. on TEXT columns). None = full column.
     pub sub_part: Option<i64>,
 }

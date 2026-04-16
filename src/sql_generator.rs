@@ -490,7 +490,7 @@ mod tests {
             is_unique: unique,
             columns: cols.into_iter().enumerate().map(|(i, (col, sp))| IndexColumn {
                 column_name: col.into(),
-                seq_in_index: (i + 1) as u32,
+                seq_in_index: (i + 1) as i64,
                 sub_part: sp,
             }).collect(),
         }
