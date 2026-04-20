@@ -941,7 +941,7 @@ async fn fetch_table_meta(pool: &MySqlPool, database: &str, table: &str) -> Resu
     for row in &index_rows {
         let idx_name: String = row.try_get("INDEX_NAME").unwrap_or_default();
         let col_name: String = row.try_get("COLUMN_NAME").unwrap_or_default();
-        let non_unique: i64 = row.try_get("NON_UNIQUE").unwrap_or(1);
+        let non_unique: i32 = row.try_get("NON_UNIQUE").unwrap_or(1);
 
         if idx_name == "PRIMARY" {
             primary_key.push(col_name);
