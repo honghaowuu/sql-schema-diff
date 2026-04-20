@@ -1,57 +1,78 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
-/// MySQL schema diff tool — compares two MySQL instances and produces a Markdown report.
 #[derive(Parser, Debug)]
-#[command(name = "mysql-schema-diff")]
+#[command(name = "sqltool")]
 pub struct Cli {
-    /// Base database host
+    #[command(subcommand)]
+    pub command: SubCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SubCommand {
+    Diff(DiffArgs),
+    CheckInserts(CheckInsertsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DiffArgs {
     #[arg(long)]
     pub base_host: String,
 
-    /// Base database port
     #[arg(long, default_value = "3306")]
     pub base_port: u16,
 
-    /// Base database username
     #[arg(long)]
     pub base_user: String,
 
-    /// Base database password
     #[arg(long)]
     pub base_password: String,
 
-    /// Check database host
     #[arg(long)]
     pub check_host: String,
 
-    /// Check database port
     #[arg(long, default_value = "3306")]
     pub check_port: u16,
 
-    /// Check database username
     #[arg(long)]
     pub check_user: String,
 
-    /// Check database password
     #[arg(long)]
     pub check_password: String,
 
-    /// Comma-separated list of databases to compare.
-    /// If omitted, all non-system databases are compared.
     #[arg(long, value_delimiter = ',')]
     pub databases: Option<Vec<String>>,
 
-    /// Output file path. Defaults to ./schema-diff-YYYYMMDD-HHMMSS.md
     #[arg(long)]
     pub output: Option<String>,
 
-    /// When set, databases present only in the base instance are silently
-    /// excluded from the diff. Databases present only in check are still reported.
     #[arg(long, default_value_t = false)]
     pub ignore_base_only_dbs: bool,
 }
 
-/// Connection parameters for one MySQL instance.
+#[derive(Args, Debug)]
+pub struct CheckInsertsArgs {
+    #[arg(long)]
+    pub host: String,
+
+    #[arg(long, default_value = "3306")]
+    pub port: u16,
+
+    #[arg(long)]
+    pub user: String,
+
+    #[arg(long)]
+    pub password: String,
+
+    #[arg(long)]
+    pub database: String,
+
+    #[arg(long)]
+    pub file: String,
+
+    #[arg(long)]
+    pub output: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
     pub host: String,
@@ -60,22 +81,16 @@ pub struct ConnectionConfig {
     pub password: String,
 }
 
-/// Non-connection options parsed from the CLI.
 #[derive(Debug)]
 pub struct Options {
-    /// If Some, only compare these database names. If None, compare all non-system databases.
     pub databases: Option<Vec<String>>,
-    /// Output file path (may be None; caller generates the default name).
     pub output: Option<String>,
-    /// Human-readable label for the base instance used in the report.
     pub base_label: String,
-    /// Human-readable label for the check instance used in the report.
     pub check_label: String,
-    /// If true, exclude databases present only in the base instance from the diff.
     pub ignore_base_only_dbs: bool,
 }
 
-impl Cli {
+impl DiffArgs {
     pub fn base_config(&self) -> ConnectionConfig {
         ConnectionConfig {
             host: self.base_host.clone(),
@@ -110,10 +125,18 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    fn diff_cli(args: &[&str]) -> DiffArgs {
+        let mut full = vec!["sqltool", "diff"];
+        full.extend_from_slice(args);
+        match Cli::parse_from(full).command {
+            SubCommand::Diff(a) => a,
+            _ => panic!("expected diff"),
+        }
+    }
+
     #[test]
     fn test_cli_parses_required_args() {
-        let cli = Cli::parse_from([
-            "mysql-schema-diff",
+        let a = diff_cli(&[
             "--base-host", "10.0.0.1",
             "--base-user", "root",
             "--base-password", "secret",
@@ -121,57 +144,53 @@ mod tests {
             "--check-user", "root",
             "--check-password", "secret2",
         ]);
-        assert_eq!(cli.base_host, "10.0.0.1");
-        assert_eq!(cli.base_port, 3306);
-        assert_eq!(cli.check_host, "10.0.0.2");
-        assert_eq!(cli.check_port, 3306);
-        assert!(cli.databases.is_none());
-        assert!(cli.output.is_none());
+        assert_eq!(a.base_host, "10.0.0.1");
+        assert_eq!(a.base_port, 3306);
+        assert_eq!(a.check_host, "10.0.0.2");
+        assert_eq!(a.check_port, 3306);
+        assert!(a.databases.is_none());
+        assert!(a.output.is_none());
     }
 
     #[test]
     fn test_cli_parses_optional_databases() {
-        let cli = Cli::parse_from([
-            "mysql-schema-diff",
+        let a = diff_cli(&[
             "--base-host", "h1", "--base-user", "u", "--base-password", "p",
             "--check-host", "h2", "--check-user", "u", "--check-password", "p",
             "--databases", "db1,db2,db3",
         ]);
-        assert_eq!(cli.databases, Some(vec!["db1".into(), "db2".into(), "db3".into()]));
+        assert_eq!(a.databases, Some(vec!["db1".into(), "db2".into(), "db3".into()]));
     }
 
     #[test]
     fn test_labels() {
-        let cli = Cli::parse_from([
-            "mysql-schema-diff",
+        let a = diff_cli(&[
             "--base-host", "10.0.0.1", "--base-port", "3307",
             "--base-user", "u", "--base-password", "p",
             "--check-host", "10.0.0.2",
             "--check-user", "u", "--check-password", "p",
         ]);
-        let opts = cli.options();
+        let opts = a.options();
         assert_eq!(opts.base_label, "10.0.0.1:3307");
         assert_eq!(opts.check_label, "10.0.0.2:3306");
     }
 
     #[test]
     fn test_ignore_base_only_dbs_flag() {
-        let cli = Cli::parse_from([
-            "mysql-schema-diff",
+        let a = diff_cli(&[
             "--base-host", "h1", "--base-user", "u", "--base-password", "p",
             "--check-host", "h2", "--check-user", "u", "--check-password", "p",
             "--ignore-base-only-dbs",
         ]);
-        assert!(cli.options().ignore_base_only_dbs);
+        assert!(a.options().ignore_base_only_dbs);
     }
 
     #[test]
     fn test_ignore_base_only_dbs_default_false() {
-        let cli = Cli::parse_from([
-            "mysql-schema-diff",
+        let a = diff_cli(&[
             "--base-host", "h1", "--base-user", "u", "--base-password", "p",
             "--check-host", "h2", "--check-user", "u", "--check-password", "p",
         ]);
-        assert!(!cli.options().ignore_base_only_dbs);
+        assert!(!a.options().ignore_base_only_dbs);
     }
 }

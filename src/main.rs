@@ -1,6 +1,7 @@
 mod config;
 mod differ;
 mod fetcher;
+mod insert_checker;
 mod reporter;
 mod schema;
 mod sql_generator;
@@ -9,16 +10,26 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use clap::Parser;
 
-use config::Cli;
+use config::{Cli, DiffArgs, SubCommand};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let base_cfg = cli.base_config();
-    let check_cfg = cli.check_config();
-    let opts = cli.options();
+    match cli.command {
+        SubCommand::Diff(args) => run_diff(args).await,
+        SubCommand::CheckInserts(args) => {
+            let exit_code = insert_checker::run(args).await?;
+            std::process::exit(exit_code);
+        }
+    }
+}
 
-    let db_filter: Option<Vec<String>> = opts.databases.clone();
+async fn run_diff(args: DiffArgs) -> Result<()> {
+    let base_cfg = args.base_config();
+    let check_cfg = args.check_config();
+    let opts = args.options();
+
+    let db_filter = opts.databases.clone();
 
     eprintln!("Connecting to base  ({})…", opts.base_label);
     eprintln!("Connecting to check ({})…", opts.check_label);
@@ -39,13 +50,12 @@ async fn main() -> Result<()> {
         check_snapshot,
         opts.base_label.clone(),
         opts.check_label.clone(),
-        generated_at.clone(),
+        generated_at,
         opts.ignore_base_only_dbs,
     );
 
     let markdown = reporter::render(&report);
 
-    // Derive output paths (strip .md suffix and add both extensions)
     let base_path = opts.output.unwrap_or_else(|| {
         let ts = Local::now().format("%Y%m%d-%H%M%S");
         format!("schema-diff-{}", ts)

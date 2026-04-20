@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "mysql-schema-diff"
+name = "sqltool"
 path = "src/main.rs"
 
 [dependencies]
@@ -13,3 +13,4 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
 anyhow = "1"
+sqlparser = "0.54"
