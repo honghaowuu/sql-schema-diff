@@ -891,18 +891,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mysql-schema-diff"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "sqlparser",
- "sqlx",
- "tokio",
-]
-
-[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1453,6 +1441,18 @@ checksum = "c66e3b7374ad4a6af849b08b3e7a6eda0edbd82f0fd59b57e22671bf16979899"
 dependencies = [
  "log",
  "recursive",
+]
+
+[[package]]
+name = "sqltool"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "sqlparser",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
